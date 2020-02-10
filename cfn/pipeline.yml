@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Automate provisioning of CodeBuild with CodePipeline CodeCommit and CodeDeploy. **WARNING** This template creates one or more Amazon EC2 instances. You will be billed for the AWS resources used if you create a stack from this template.
+Parameters:
+  EmailAddress:
+    Type: String
+  RepositoryBranch:
+    Type: String
+    Default: master
+
+
+
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+      BucketName: !Sub ${AWS::StackName}-lambda-error-bucket
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: WebsiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal: "*"
+          Action: s3:PutObject
+          Resource:
+            Fn::Join:
+              - ""
+              - - "arn:aws:s3:::"
+                - Ref: WebsiteBucket
+                - "/*"
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      AccessControl: BucketOwnerFullControl
+  MySNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties: 
+      DisplayName: String
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: "email"
+      TopicName: 
+        Ref: AWS::StackName
+  CodeCommitJavaRepo:
+   Type: AWS::CodeCommit::Repository
+   Properties:
+     RepositoryName:
+       Ref: AWS::StackName
+     RepositoryDescription: CodeCommit Repository
+     Triggers:
+     - Name: MasterTrigger
+       CustomData: Project ID 12345
+       DestinationArn:
+         Ref: MySNSTopic
+       Branches:
+       - Master
+       Events:
+       - all
+  CodePipelineStack:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt [CodePipelineRole, Arn]
+      ArtifactStore:
+        Location:
+          Ref:
+            ArtifactStoreBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: MyApp
+              Configuration:
+                BranchName: !Ref RepositoryBranch
+                RepositoryName: !Ref AWS::StackName
+              RunOrder: 1
+        - Name: Build
+          Actions:
+          - Name: Build
+            ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+            OutputArtifacts:
+              - Name: MyAppBuild
+            InputArtifacts:
+              - Name: MyApp
+            Configuration:
+                ProjectName: !Ref CodeBuildJavaProject
+            RunOrder: 1
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  CodeBuildJavaProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: CodeBuildRole
+    Properties:
+      Artifacts:
+        Location:
+          Ref:
+            ArtifactStoreBucket
+        Type: S3
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/java:openjdk-8
+        Type: LINUX_CONTAINER
+      Name: !Sub ${AWS::StackName}CodeBuildJavaProject
+      ServiceRole: !Ref CodeBuildRole
+      Source:
+        Type: CODECOMMIT
+        Location:
+          Fn::Join:
+            - ""
+            - - "https://git-codecommit."
+              - Ref: AWS::Region
+              - ".amazonaws.com/v1/repos/"
+              - Ref: AWS::StackName
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+  EventRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "EventRule"
+      EventPattern: 
+        source: 
+          - "aws.codebuild"
+        detail-type: 
+          - "CodeBuild Build State Change"
+        detail: 
+          build-status: 
+            - SUCCEEDED
+            - FAILED
+            - IN_PROGRESS
+            - STOPPED
+          project-name:
+            - !Sub ${AWS::StackName}CodeBuildJavaProject
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "LambdaFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "LambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "EventRule"
+          - "Arn"
+  S3UploadLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+          RoleName:
+            Fn::Sub: S3UploadLambdaRole-${AWS::StackName}
+          AssumeRolePolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Principal:
+                  Service:
+                    - "lambda.amazonaws.com"
+                Action:
+                  - "sts:AssumeRole"
+          Path: /
+          Policies:
+              -
+                PolicyName:
+                  Fn::Sub: S3UploadLambdaRole-${AWS::StackName}-Policy
+                PolicyDocument:
+                  Version: "2012-10-17"
+                  Statement:
+                    -
+                      Effect: "Allow"
+                      Action:
+                        - "logs:CreateLogGroup"
+                        - "logs:CreateLogStream"
+                        - "logs:PutLogEvents"
+                      Resource:
+                        - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+                    -
+                      Effect: "Allow"
+                      Action:
+                        - "s3:PutObject"
+                        - "s3:GetObject"
+                        - "s3:GetObjectVersion"
+                        - "s3:ListBucket"
+                        - "s3:PutObjectAcl"
+                      Resource: "*"
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Role:
+        Fn::GetAtt:
+          - "S3UploadLambdaRole"
+          - "Arn"
+      Runtime: "python3.7"
+      Timeout: 150
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub ${AWS::StackName}-lambda-error-bucket
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import uuid
+
+          def lambda_handler(event, context):
+            filename = uuid.uuid1()
+            s3 = boto3.client('s3')
+            bucket = os.environ["BUCKET_NAME"]
+            print(bucket)
+            key = "result/buildresult"
+            s3.put_object(Body=json.dumps(event), Bucket= bucket, Key=f'{key}/{filename}.json')
+
+            return "Completed"
+
+Outputs:
+  CodeBuildURL:
+    Description: CodeBuild URL
+    Value: 
+      Fn::Join:
+        - ""
+        - - "https://console.aws.amazon.com/codebuild/home?region="
+          - Ref: AWS::Region
+          - "#/projects/"
+          - Ref: CodeBuildJavaProject
+          - "/view"
+  CodeCommitURL:
+    Description: CodeCommit URL
+    Value: 
+      Fn::Join:
+        - ""
+        - - "https://console.aws.amazon.com/codepipeline/home?region="
+          - Ref: AWS::Region
+          - "#/repository/"
+          - Ref: AWS::StackName
+          - "/browse/HEAD/--/"
+  CodeDeployURL:
+    Description: CodeDeploy URL
+    Value: 
+      Fn::Join:
+        - ""
+        - - "https://console.aws.amazon.com/codedeploy/home?region="
+          - Ref: AWS::Region
+          - "#/deployments/"
+  CloneUrlSsh:
+    Description: SSH command for connecting to the CodeCommit repo
+    Value: 
+      Fn::Join:
+        - ""
+        - - "git clone "
+          - !GetAtt [CodeCommitJavaRepo, CloneUrlSsh]
+          - ""
+  CodePipelineURL:
+    Description: CodePipeline URL
+    Value:
+      Fn::Join:
+        - ""
+        - - "https://console.aws.amazon.com/codepipeline/home?region="
+          - Ref: AWS::Region
+          - "#/view/"
+          - Ref: CodePipelineStack
+
